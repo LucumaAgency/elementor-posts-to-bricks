@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Fospibay CSV Import Plugin
  * Description: Imports posts, categories, and images from a CSV in batches, cleans content, downloads images, sets featured image, saves galleries to ACF field, handles duplicates, and avoids re-uploading existing images using filename.
- * Version: 2.4
+ * Version: 2.8
  * Author: Grok
  */
 
@@ -115,37 +115,54 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
     fclose($file_handle);
     fospibay_log_error('Primeras líneas del CSV para depuración: ' . implode('\n', $preview_lines));
 
-    $file = new SplFileObject($file_path);
-    $file->setFlags(SplFileObject::READ_CSV | SplFileObject::READ_AHEAD | SplFileObject::SKIP_EMPTY | SplFileObject::DROP_NEW_LINE);
-    $file->setCsvControl($delimiter, '"', '\\');
-
-    $headers = $file->fgetcsv();
-    if ($headers && isset($headers[0])) {
-        $headers[0] = preg_replace('/^\xEF\xBB\xBF/', '', $headers[0]); // Remove BOM
+    // Read headers
+    $file_handle = fopen($file_path, 'r');
+    $raw_headers = fgetcsv($file_handle, 0, $delimiter, '"', '\\');
+    if ($raw_headers && isset($raw_headers[0])) {
+        $raw_headers[0] = preg_replace('/^\xEF\xBB\xBF/', '', $raw_headers[0]); // Remove BOM
     }
-    if (empty($headers) || count($headers) < 2) {
+    fospibay_log_error('Encabezados crudos del CSV: ' . print_r($raw_headers, true));
+    if (empty($raw_headers) || count($raw_headers) < 2) {
         echo '<div class="error"><p>Error: No se encontraron encabezados válidos en el CSV.</p></div>';
-        fospibay_log_error('No se encontraron encabezados válidos en el CSV o encabezados insuficientes: ' . print_r($headers, true));
+        fospibay_log_error('No se encontraron encabezados válidos en el CSV o encabezados insuficientes: ' . print_r($raw_headers, true));
+        fclose($file_handle);
         return;
     }
-    fospibay_log_error('Encabezados del CSV: ' . implode(', ', $headers));
 
-    // Map headers to indices
-    $header_map = array_flip($headers);
+    // Handle duplicate headers
+    $header_map = [];
+    $used_headers = [];
+    foreach ($raw_headers as $index => $header) {
+        $original_header = trim($header);
+        $new_header = $original_header;
+        $suffix = 1;
+        while (isset($used_headers[$new_header])) {
+            $new_header = $original_header . '_' . $suffix;
+            $suffix++;
+        }
+        $header_map[$new_header] = $index;
+        $used_headers[$new_header] = true;
+    }
+    $headers = array_keys($header_map);
+    fospibay_log_error('Encabezados del CSV procesados: ' . implode(', ', $headers) . ' (Total: ' . count($headers) . ')');
+
+    // Validate required headers
     $required_headers = ['Title', 'Content'];
     foreach ($required_headers as $req_header) {
-        if (!isset($header_map[$req_header])) {
+        if (!in_array($req_header, $headers)) {
             echo '<div class="error"><p>Error: Falta el encabezado requerido "' . $req_header . '" en el CSV.</p></div>';
             fospibay_log_error('Falta el encabezado requerido "' . $req_header . '" en el CSV.');
+            fclose($file_handle);
             return;
         }
     }
     fospibay_log_error('Encabezados requeridos encontrados: ' . implode(', ', $required_headers));
 
+    // Find featured image header
     $featured_image_header = null;
-    $possible_image_headers = ['URL', 'url', 'Featured Image', 'featured_image', 'image_url', 'Image URL'];
+    $possible_image_headers = ['Featured', 'URL', 'url', 'Featured Image', 'featured_image', 'image_url', 'Image URL', 'URL_2'];
     foreach ($possible_image_headers as $header) {
-        if (isset($header_map[$header])) {
+        if (in_array($header, $headers)) {
             $featured_image_header = $header;
             fospibay_log_error('Encabezado de imagen destacada encontrado: ' . $header . ' (índice ' . $header_map[$header] . ')');
             break;
@@ -158,7 +175,7 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
     $elementor_data_header = null;
     $possible_elementor_headers = ['_elementor_data', 'elementor_data', 'Elementor Data'];
     foreach ($possible_elementor_headers as $header) {
-        if (isset($header_map[$header])) {
+        if (in_array($header, $headers)) {
             $elementor_data_header = $header;
             fospibay_log_error('Encabezado de datos Elementor encontrado: ' . $header);
             break;
@@ -168,7 +185,7 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
     $categories_header = null;
     $possible_categories_headers = ['Categorías', 'Categories', 'category'];
     foreach ($possible_categories_headers as $header) {
-        if (isset($header_map[$header])) {
+        if (in_array($header, $headers)) {
             $categories_header = $header;
             fospibay_log_error('Encabezado de categorías encontrado: ' . $header);
             break;
@@ -181,20 +198,27 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
     $row_index = 2;
     $batch = [];
     $batch_number = 1;
-    while (!$file->eof()) {
-        $row = $file->fgetcsv();
-        if ($row === false || $row === null || (is_array($row) && empty(array_filter($row, function($value) { return trim($value) !== ''; })))) {
-            fospibay_log_error('Fila ' . $row_index . ' está vacía o inválida, omitiendo. Raw data: ' . print_r($row, true));
+    while (($row = fgetcsv($file_handle, 0, $delimiter, '"', '\\')) !== false) {
+        fospibay_log_error('Datos crudos de la fila ' . $row_index . ': ' . print_r($row, true));
+        if (empty(array_filter($row, function($value) { return trim($value) !== ''; }))) {
+            fospibay_log_error('Fila ' . $row_index . ' está vacía o inválida, omitiendo.');
             $skipped++;
             $row_index++;
             continue;
         }
 
-        // Pad row to match headers and combine
-        $row = array_pad($row, count($headers), '');
+        // Handle column count mismatch
+        if (count($row) !== count($headers)) {
+            fospibay_log_error('Advertencia en fila ' . $row_index . ': Número de columnas (' . count($row) . ') no coincide con encabezados (' . count($headers) . '). Ajustando fila.');
+            $row = array_slice($row, 0, count($headers)); // Truncate to header count
+            $row = array_pad($row, count($headers), ''); // Pad with empty strings if needed
+            fospibay_log_error('Fila ajustada ' . $row_index . ': ' . print_r($row, true));
+        }
+
+        // Combine row with headers
         $data = array_combine($headers, $row);
         if ($data === false) {
-            fospibay_log_error('Error al combinar fila ' . $row_index . ' con encabezados. Raw data: ' . print_r($row, true));
+            fospibay_log_error('Error al combinar fila ' . $row_index . ' con encabezados. Número de encabezados: ' . count($headers) . ', Número de columnas: ' . count($row) . '. Raw data: ' . print_r($row, true));
             $skipped++;
             $row_index++;
             continue;
@@ -329,7 +353,7 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
         $row_index++;
 
         $batch[] = $row;
-        if (count($batch) >= $batch_size || $file->eof()) {
+        if (count($batch) >= $batch_size || feof($file_handle)) {
             fospibay_log_error('Lote ' . $batch_number . ' procesado. Filas procesadas: ' . count($batch) . ', Creadas: ' . $imported . ', Actualizadas: ' . $updated . ', Omitidas: ' . $skipped);
             $batch = [];
             $batch_number++;
@@ -337,6 +361,7 @@ function fospibay_process_csv($file_path, $skip_existing = false, $batch_size = 
         }
     }
 
+    fclose($file_handle);
     echo '<div class="updated"><p>Importación completada. Entradas creadas: ' . $imported . ', actualizadas: ' . $updated . ', omitidas: ' . $skipped . '</p></div>';
     fospibay_log_error('Importación completada. Entradas creadas: ' . $imported . ', actualizadas: ' . $updated . ', omitidas: ' . $skipped);
 }
@@ -371,48 +396,61 @@ function fospibay_clean_and_import_images($post_id, $data, $featured_image_heade
     }
 
     if ($featured_image_header && !empty($data[$featured_image_header])) {
-        $image_url = $data[$featured_image_header];
+        $image_url = trim($data[$featured_image_header]);
         fospibay_log_error('Procesando imagen destacada para entrada ID ' . $post_id . ': ' . $image_url);
 
-        $response = wp_safe_remote_head($image_url, ['timeout' => 60]);
-        if (is_wp_error($response)) {
-            fospibay_log_error('Error al verificar accesibilidad de imagen destacada: ' . $image_url . ' - ' . $response->get_error_message());
+        if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
+            fospibay_log_error('URL de imagen destacada inválida: ' . $image_url . ' para entrada ID ' . $post_id);
         } else {
-            $response_code = wp_remote_retrieve_response_code($response);
-            fospibay_log_error('Respuesta HTTP para imagen destacada: ' . $image_url . ' - Código: ' . $response_code);
-            if ($response_code !== 200) {
-                fospibay_log_error('Error: La URL de la imagen destacada no es accesible: ' . $image_url . ' - Código HTTP: ' . $response_code);
+            $response = wp_safe_remote_head($image_url, ['timeout' => 60]);
+            if (is_wp_error($response)) {
+                fospibay_log_error('Error al verificar accesibilidad de imagen destacada: ' . $image_url . ' - ' . $response->get_error_message());
             } else {
-                $existing_image_id = fospibay_check_existing_image($image_url);
-                if ($existing_image_id) {
-                    $featured_image_id = $existing_image_id;
-                    fospibay_log_error('Reutilizando imagen destacada existente para entrada ID ' . $post_id . ': ID ' . $featured_image_id);
+                $response_code = wp_remote_retrieve_response_code($response);
+                fospibay_log_error('Respuesta HTTP para imagen destacada: ' . $image_url . ' - Código: ' . $response_code);
+                if ($response_code !== 200) {
+                    fospibay_log_error('Error: La URL de la imagen destacada no es accesible: ' . $image_url . ' - Código HTTP: ' . $response_code);
                 } else {
-                    $featured_image_id = fospibay_download_and_attach_image($image_url, $post_id);
-                    if ($featured_image_id && !is_wp_error($featured_image_id)) {
-                        fospibay_log_error('Imagen destacada subida para entrada ID ' . $post_id . ': ID ' . $featured_image_id);
+                    $existing_image_id = fospibay_check_existing_image($image_url);
+                    if ($existing_image_id) {
+                        $featured_image_id = $existing_image_id;
+                        fospibay_log_error('Reutilizando imagen destacada existente para entrada ID ' . $post_id . ': ID ' . $featured_image_id);
                     } else {
-                        fospibay_log_error('Error al procesar imagen destacada para entrada ID ' . $post_id . ': ' . ($featured_image_id ? $featured_image_id->get_error_message() : 'URL inválida o fallo en la descarga'));
-                    }
-                }
-                if ($featured_image_id && !is_wp_error($featured_image_id)) {
-                    $attachment = get_post($featured_image_id);
-                    if ($attachment && strpos($attachment->post_mime_type, 'image/') === 0) {
-                        fospibay_log_error('Verificando tipo MIME de imagen destacada ID ' . $featured_image_id . ': ' . $attachment->post_mime_type);
-                        $result = set_post_thumbnail($post_id, $featured_image_id);
-                        if ($result) {
-                            fospibay_log_error('Imagen destacada asignada correctamente a entrada ID ' . $post_id . ': ID ' . $featured_image_id);
+                        $featured_image_id = fospibay_download_and_attach_image($image_url, $post_id);
+                        if ($featured_image_id && !is_wp_error($featured_image_id)) {
+                            fospibay_log_error('Imagen destacada subida para entrada ID ' . $post_id . ': ID ' . $featured_image_id);
                         } else {
-                            fospibay_log_error('Error al asignar imagen destacada a entrada ID ' . $post_id . ': Fallo en set_post_thumbnail');
+                            fospibay_log_error('Error al procesar imagen destacada para entrada ID ' . $post_id . ': ' . ($featured_image_id ? $featured_image_id->get_error_message() : 'URL inválida o fallo en la descarga'));
                         }
-                    } else {
-                        fospibay_log_error('Error: El ID ' . $featured_image_id . ' no corresponde a una imagen válida para entrada ID ' . $post_id);
+                    }
+                    if ($featured_image_id && !is_wp_error($featured_image_id)) {
+                        $attachment = get_post($featured_image_id);
+                        if ($attachment && strpos($attachment->post_mime_type, 'image/') === 0) {
+                            fospibay_log_error('Verificando tipo MIME de imagen destacada ID ' . $featured_image_id . ': ' . $attachment->post_mime_type);
+                            // Generate metadata before setting thumbnail
+                            $file_path = get_attached_file($featured_image_id);
+                            if ($file_path) {
+                                $attachment_data = wp_generate_attachment_metadata($featured_image_id, $file_path);
+                                wp_update_attachment_metadata($featured_image_id, $attachment_data);
+                                fospibay_log_error('Metadatos de imagen destacada generados para ID ' . $featured_image_id);
+                            } else {
+                                fospibay_log_error('Error: No se pudo obtener la ruta del archivo para imagen destacada ID ' . $featured_image_id);
+                            }
+                            $result = set_post_thumbnail($post_id, $featured_image_id);
+                            if ($result) {
+                                fospibay_log_error('Imagen destacada asignada correctamente a entrada ID ' . $post_id . ': ID ' . $featured_image_id);
+                            } else {
+                                fospibay_log_error('Error al asignar imagen destacada a entrada ID ' . $post_id . ': Fallo en set_post_thumbnail');
+                            }
+                        } else {
+                            fospibay_log_error('Error: El ID ' . $featured_image_id . ' no corresponde a una imagen válida para entrada ID ' . $post_id);
+                        }
                     }
                 }
             }
         }
     } else {
-        fospibay_log_error('No se encontró URL de imagen destacada para entrada ID ' . $post_id . ' (encabezado: ' . ($featured_image_header ?: 'ninguno') . ')');
+        fospibay_log_error('No se encontró URL de imagen destacada para entrada ID ' . $post_id . ' (encabezado: ' . ($featured_image_header ?: 'ninguno') . ', valor: ' . ($data[$featured_image_header] ?? 'vacío') . ')');
     }
 
     if ($elementor_data_header && !empty($data[$elementor_data_header])) {
@@ -554,8 +592,8 @@ function fospibay_download_and_attach_image($image_url, $post_id) {
     fospibay_log_error('Adjunto creado con ID: ' . $attachment_id);
 
     $attachment_data = wp_generate_attachment_metadata($attachment_id, $file_path);
-    fospibay_log_error('Metadatos de adjunto generados: ' . wp_json_encode($attachment_data));
     wp_update_attachment_metadata($attachment_id, $attachment_data);
+    fospibay_log_error('Metadatos de adjunto generados: ' . wp_json_encode($attachment_data));
 
     fospibay_log_error('Imagen subida correctamente: ' . $image_url . ' - ID: ' . $attachment_id);
     return $attachment_id;
